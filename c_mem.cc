@@ -145,6 +145,30 @@ nowUtc()
 }
 
 // =====================================================================
+// SQLite ヘルパー
+// =====================================================================
+
+static sqlite3_stmt *
+prepareOrThrow(sqlite3 *db, const char *sql)
+{
+	sqlite3_stmt *stmt = nullptr;
+	if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK)
+		throw std::runtime_error(std::string("SQL prepare failed: ") + sqlite3_errmsg(db));
+	return stmt;
+}
+
+static void
+execOrThrow(sqlite3 *db, const char *sql)
+{
+	char *errMsg = nullptr;
+	if (sqlite3_exec(db, sql, nullptr, nullptr, &errMsg) != SQLITE_OK) {
+		std::string msg = errMsg ? errMsg : "unknown error";
+		sqlite3_free(errMsg);
+		throw std::runtime_error("SQL exec failed: " + msg);
+	}
+}
+
+// =====================================================================
 // MemDB — SQLite + sqlite-vec
 // =====================================================================
 
@@ -167,21 +191,20 @@ MemDB::MemDB(const std::string &path, const std::string &vecExtPath)
 	sqlite3_enable_load_extension(db_, 0);
 
 	// テーブル作成
-	const char *ddl =
+	execOrThrow(db_,
 		"CREATE TABLE IF NOT EXISTS memories ("
 		"  id INTEGER PRIMARY KEY AUTOINCREMENT,"
 		"  content TEXT NOT NULL,"
 		"  tags TEXT DEFAULT '[]',"
 		"  created_at TEXT NOT NULL,"
 		"  updated_at TEXT NOT NULL"
-		");";
-	sqlite3_exec(db_, ddl, nullptr, nullptr, nullptr);
+		")");
 
 	std::string vecDdl =
 		"CREATE VIRTUAL TABLE IF NOT EXISTS memories_vec "
 		"USING vec0(id INTEGER PRIMARY KEY, embedding float[" +
 		std::to_string(EMBED_DIM) + "])";
-	sqlite3_exec(db_, vecDdl.c_str(), nullptr, nullptr, nullptr);
+	execOrThrow(db_, vecDdl.c_str());
 }
 
 MemDB::~MemDB()
@@ -209,7 +232,10 @@ CMem::CMem()
 		vecExtPath_ = p;
 
 	// グローバルDB
-	std::string home = std::getenv("HOME");
+	auto *homeEnv = std::getenv("HOME");
+	if (!homeEnv)
+		throw std::runtime_error("HOME environment variable is not set");
+	std::string home = homeEnv;
 	std::string globalPath = home + "/.local/share/c-mem/global.db";
 	globalDb_ = std::make_unique<MemDB>(globalPath, vecExtPath_);
 
@@ -257,10 +283,8 @@ CMem::doStore(sqlite3 *conn, const std::string &content, const json &tags, bool 
 	auto emb = embed(safe);
 
 	// INSERT memories
-	sqlite3_stmt *stmt = nullptr;
-	sqlite3_prepare_v2(conn,
-		"INSERT INTO memories (content, tags, created_at, updated_at) VALUES (?,?,?,?)",
-		-1, &stmt, nullptr);
+	auto *stmt = prepareOrThrow(conn,
+		"INSERT INTO memories (content, tags, created_at, updated_at) VALUES (?,?,?,?)");
 	std::string tagsStr = tags.dump();
 	sqlite3_bind_text(stmt, 1, safe.c_str(), -1, SQLITE_TRANSIENT);
 	sqlite3_bind_text(stmt, 2, tagsStr.c_str(), -1, SQLITE_TRANSIENT);
@@ -272,9 +296,8 @@ CMem::doStore(sqlite3 *conn, const std::string &content, const json &tags, bool 
 	int64_t id = sqlite3_last_insert_rowid(conn);
 
 	// INSERT memories_vec
-	sqlite3_prepare_v2(conn,
-		"INSERT INTO memories_vec (id, embedding) VALUES (?,?)",
-		-1, &stmt, nullptr);
+	stmt = prepareOrThrow(conn,
+		"INSERT INTO memories_vec (id, embedding) VALUES (?,?)");
 	sqlite3_bind_int64(stmt, 1, id);
 	sqlite3_bind_blob(stmt, 2, emb.data(), static_cast<int>(emb.size()), SQLITE_TRANSIENT);
 	sqlite3_step(stmt);
@@ -307,8 +330,7 @@ CMem::searchInDb(sqlite3 *db, const std::string &source,
                  const std::vector<char> &embedding, int limit, const std::string &tag)
 {
 	// レコード0件チェック
-	sqlite3_stmt *cnt = nullptr;
-	sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM memories", -1, &cnt, nullptr);
+	auto *cnt = prepareOrThrow(db, "SELECT COUNT(*) FROM memories");
 	sqlite3_step(cnt);
 	int count = sqlite3_column_int(cnt, 0);
 	sqlite3_finalize(cnt);
@@ -317,14 +339,12 @@ CMem::searchInDb(sqlite3 *db, const std::string &source,
 
 	int k = tag.empty() ? limit : limit * 3;
 
-	sqlite3_stmt *stmt = nullptr;
-	sqlite3_prepare_v2(db,
+	auto *stmt = prepareOrThrow(db,
 		"SELECT m.id, m.content, m.tags, m.created_at, v.distance "
 		"FROM memories_vec v "
 		"JOIN memories m ON m.id = v.id "
 		"WHERE v.embedding MATCH ? AND k = ? "
-		"ORDER BY v.distance",
-		-1, &stmt, nullptr);
+		"ORDER BY v.distance");
 	sqlite3_bind_blob(stmt, 1, embedding.data(), static_cast<int>(embedding.size()), SQLITE_TRANSIENT);
 	sqlite3_bind_int(stmt, 2, k);
 
@@ -405,8 +425,7 @@ CMem::toolForget(const json &args)
 	std::string scope = args.value("scope", "project");
 	sqlite3 *conn = getConn(scope);
 
-	sqlite3_stmt *stmt = nullptr;
-	sqlite3_prepare_v2(conn, "SELECT id FROM memories WHERE id = ?", -1, &stmt, nullptr);
+	auto *stmt = prepareOrThrow(conn, "SELECT id FROM memories WHERE id = ?");
 	sqlite3_bind_int64(stmt, 1, id);
 	bool found = sqlite3_step(stmt) == SQLITE_ROW;
 	sqlite3_finalize(stmt);
@@ -414,12 +433,12 @@ CMem::toolForget(const json &args)
 	if (!found)
 		return "ID " + std::to_string(id) + " の記憶は見つかりませんでした。(" + scope + ")";
 
-	sqlite3_prepare_v2(conn, "DELETE FROM memories WHERE id = ?", -1, &stmt, nullptr);
+	stmt = prepareOrThrow(conn, "DELETE FROM memories WHERE id = ?");
 	sqlite3_bind_int64(stmt, 1, id);
 	sqlite3_step(stmt);
 	sqlite3_finalize(stmt);
 
-	sqlite3_prepare_v2(conn, "DELETE FROM memories_vec WHERE id = ?", -1, &stmt, nullptr);
+	stmt = prepareOrThrow(conn, "DELETE FROM memories_vec WHERE id = ?");
 	sqlite3_bind_int64(stmt, 1, id);
 	sqlite3_step(stmt);
 	sqlite3_finalize(stmt);
@@ -447,18 +466,16 @@ CMem::toolList(const json &args)
 	std::vector<Entry> all;
 
 	auto fetch = [&](sqlite3 *db, const std::string &src) {
-		sqlite3_stmt *stmt = nullptr;
+		sqlite3_stmt *stmt;
 		if (tag.empty()) {
-			sqlite3_prepare_v2(db,
+			stmt = prepareOrThrow(db,
 				"SELECT id, content, tags, created_at FROM memories "
-				"ORDER BY created_at DESC LIMIT ?",
-				-1, &stmt, nullptr);
+				"ORDER BY created_at DESC LIMIT ?");
 			sqlite3_bind_int(stmt, 1, limit);
 		} else {
-			sqlite3_prepare_v2(db,
+			stmt = prepareOrThrow(db,
 				"SELECT id, content, tags, created_at FROM memories "
-				"ORDER BY created_at DESC",
-				-1, &stmt, nullptr);
+				"ORDER BY created_at DESC");
 		}
 
 		while (sqlite3_step(stmt) == SQLITE_ROW) {
@@ -515,8 +532,7 @@ CMem::toolUpdate(const json &args)
 	sqlite3 *conn = getConn(scope);
 
 	// 存在確認
-	sqlite3_stmt *stmt = nullptr;
-	sqlite3_prepare_v2(conn, "SELECT id FROM memories WHERE id = ?", -1, &stmt, nullptr);
+	auto *stmt = prepareOrThrow(conn, "SELECT id FROM memories WHERE id = ?");
 	sqlite3_bind_int64(stmt, 1, id);
 	bool found = sqlite3_step(stmt) == SQLITE_ROW;
 	sqlite3_finalize(stmt);
@@ -530,18 +546,16 @@ CMem::toolUpdate(const json &args)
 	auto emb = embed(safe);
 
 	if (hasTags) {
-		sqlite3_prepare_v2(conn,
-			"UPDATE memories SET content = ?, tags = ?, updated_at = ? WHERE id = ?",
-			-1, &stmt, nullptr);
+		stmt = prepareOrThrow(conn,
+			"UPDATE memories SET content = ?, tags = ?, updated_at = ? WHERE id = ?");
 		std::string tagsStr = tags.dump();
 		sqlite3_bind_text(stmt, 1, safe.c_str(), -1, SQLITE_TRANSIENT);
 		sqlite3_bind_text(stmt, 2, tagsStr.c_str(), -1, SQLITE_TRANSIENT);
 		sqlite3_bind_text(stmt, 3, now.c_str(), -1, SQLITE_TRANSIENT);
 		sqlite3_bind_int64(stmt, 4, id);
 	} else {
-		sqlite3_prepare_v2(conn,
-			"UPDATE memories SET content = ?, updated_at = ? WHERE id = ?",
-			-1, &stmt, nullptr);
+		stmt = prepareOrThrow(conn,
+			"UPDATE memories SET content = ?, updated_at = ? WHERE id = ?");
 		sqlite3_bind_text(stmt, 1, safe.c_str(), -1, SQLITE_TRANSIENT);
 		sqlite3_bind_text(stmt, 2, now.c_str(), -1, SQLITE_TRANSIENT);
 		sqlite3_bind_int64(stmt, 3, id);
@@ -550,14 +564,13 @@ CMem::toolUpdate(const json &args)
 	sqlite3_finalize(stmt);
 
 	// ベクトル更新
-	sqlite3_prepare_v2(conn, "DELETE FROM memories_vec WHERE id = ?", -1, &stmt, nullptr);
+	stmt = prepareOrThrow(conn, "DELETE FROM memories_vec WHERE id = ?");
 	sqlite3_bind_int64(stmt, 1, id);
 	sqlite3_step(stmt);
 	sqlite3_finalize(stmt);
 
-	sqlite3_prepare_v2(conn,
-		"INSERT INTO memories_vec (id, embedding) VALUES (?,?)",
-		-1, &stmt, nullptr);
+	stmt = prepareOrThrow(conn,
+		"INSERT INTO memories_vec (id, embedding) VALUES (?,?)");
 	sqlite3_bind_int64(stmt, 1, id);
 	sqlite3_bind_blob(stmt, 2, emb.data(), static_cast<int>(emb.size()), SQLITE_TRANSIENT);
 	sqlite3_step(stmt);
