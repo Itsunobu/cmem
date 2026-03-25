@@ -88,4 +88,4 @@ c_mem.h/cc         メモリロジック — store, search, forget, list, update
 
 ## ライセンス
 
-MIT
+[MIT](LICENSE) - Copyright (c) 2026 Itsunobu MIZUMA
