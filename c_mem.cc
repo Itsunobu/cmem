@@ -180,6 +180,10 @@ MemDB::MemDB(const std::string &path, const std::string &vecExtPath)
 	if (sqlite3_open(path.c_str(), &db_) != SQLITE_OK)
 		throw std::runtime_error("sqlite3_open failed: " + path);
 
+	// WAL モード + busy timeout
+	execOrThrow(db_, "PRAGMA journal_mode=WAL");
+	sqlite3_busy_timeout(db_, 5000);
+
 	// sqlite-vec 拡張読み込み
 	sqlite3_enable_load_extension(db_, 1);
 	char *errMsg = nullptr;
